@@ -1,30 +1,78 @@
-'use strict'
+import express from 'express';
+import cors from 'cors';
+import bcrypt from 'bcrypt';
+import dotenv from 'dotenv';
+import pool from './database.js';
 
-const path = require('node:path')
-const AutoLoad = require('@fastify/autoload')
+dotenv.config();
 
-// Pass --options via CLI arguments in command to enable these options.
-const options = {}
+const app = express();
+const port = process.env.PORT || 3001;
 
-module.exports = async function (fastify, opts) {
-  // Place here your custom code!
+// Configure CORS
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || 'http://localhost:5173'
+}));
 
-  // Do not touch the following lines
+app.use(express.json());
 
-  // This loads all plugins defined in plugins
-  // those should be support plugins that are reused
-  // through your application
-  fastify.register(AutoLoad, {
-    dir: path.join(__dirname, 'plugins'),
-    options: Object.assign({}, opts)
-  })
+// Note: We receive a SHA-256 digest from the frontend, NEVER a plaintext password.
+// This prevents plaintext passwords from touching the network or backend server memory.
+// We then hash this digest with bcrypt before storing it to protect against DB leaks.
 
-  // This loads all plugins defined in routes
-  // define your routes in one of these
-  fastify.register(AutoLoad, {
-    dir: path.join(__dirname, 'routes'),
-    options: Object.assign({}, opts)
-  })
-}
+app.post('/api/save-password', async (req, res) => {
+  const { sessionId, digest } = req.body;
 
-module.exports.options = options
+  if (!sessionId || !digest) {
+    return res.status(400).json({ error: 'sessionId and digest are required fields' });
+  }
+
+  try {
+    // Hash the digest using bcrypt
+    const saltRounds = 10;
+    const bcryptHash = await bcrypt.hash(digest, saltRounds);
+
+    // Store in DB, scoped by sessionId
+    const query = 'INSERT INTO password_history (session_id, hash) VALUES ($1, $2)';
+    await pool.query(query, [sessionId, bcryptHash]);
+
+    res.status(201).json({ message: 'Password digest saved successfully' });
+  } catch (error) {
+    console.error('Error saving password:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/check-reuse', async (req, res) => {
+  const { sessionId, digest } = req.body;
+
+  if (!sessionId || !digest) {
+    return res.status(400).json({ error: 'sessionId and digest are required fields' });
+  }
+
+  try {
+    // Retrieve all saved hashes for this session
+    const query = 'SELECT hash FROM password_history WHERE session_id = $1';
+    const result = await pool.query(query, [sessionId]);
+
+    let isReused = false;
+
+    // Check incoming digest against stored bcrypt hashes
+    for (const row of result.rows) {
+      const match = await bcrypt.compare(digest, row.hash);
+      if (match) {
+        isReused = true;
+        break;
+      }
+    }
+
+    res.json({ isReused });
+  } catch (error) {
+    console.error('Error checking password reuse:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server listening on port ${port}`);
+});
